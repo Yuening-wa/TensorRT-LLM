@@ -9,7 +9,8 @@ from .interface import MoE
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
                            FP8QDQFusedMoEMethod, MoEWeightLoadingMode,
                            NVFP4CutlassFusedMoEMethod,
-                           UnquantizedFusedMoEMethod, WInt4AFP8FusedMoEMethod)
+                           UnquantizedFusedMoEMethod, WeightOnlyFusedMoEMethod,
+                           WInt4AFP8FusedMoEMethod)
 from .routing import BaseMoeRoutingMethod
 
 
@@ -34,6 +35,8 @@ class CutlassFusedMoE(MoE):
                 FusedMoE Op: dynamic quant + scatter + gemm1 + swiglu + gemm2 + finalizeMoeRoute (return one tensor)
             p8 qdq, nvfp4:
                 FusedMoE Op: scatter + gemm1 + swiglu + gemm2 + finalizeMoeRoute (return one tensor)
+            weight only:
+                FusedMoE Op: ... to finish
 
     FusedMoE module:
         max-throughput mode:
@@ -130,8 +133,7 @@ class CutlassFusedMoE(MoE):
             if not (self.quant_config.quant_mode.has_nvfp4()
                     | self.quant_config.quant_mode.has_fp8_block_scales()
                     | self.quant_config.quant_mode.has_fp8_qdq()
-                    | self.quant_config.quant_mode.
-                    is_int4_weight_only_per_group()):
+                    | self.quant_config.quant_mode.is_weight_only()):
                 raise ValueError(
                     f"unsupported quantization mode: {self.quant_config.quant_mode}"
                 )
@@ -141,6 +143,11 @@ class CutlassFusedMoE(MoE):
         assert self._weights_created
         return self.quant_config and self.quant_config.quant_mode.is_int4_weight_only_per_group(
         )
+
+    @property
+    def has_woq_per_group_scaling(self):
+        return self.quant_config.layer_quant_mode.is_weight_only(
+        ) and self.quant_config.layer_quant_mode.has_per_group_scaling()
 
     def _get_quant_method(self):
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
@@ -154,6 +161,10 @@ class CutlassFusedMoE(MoE):
             elif self.quant_config.layer_quant_mode.is_int4_weight_only_per_group(
             ):
                 return WInt4AFP8FusedMoEMethod()
+            elif self.quant_config.layer_quant_mode.is_weight_only(
+            ) and not self.quant_config.layer_quant_mode.has_per_group_scaling(
+            ):
+                return WeightOnlyFusedMoEMethod()
             else:
                 raise ValueError(
                     f"Unsupported quantization mode: {self.quant_config.quant_mode}"
@@ -223,6 +234,7 @@ class CutlassFusedMoE(MoE):
         # quantize inputs
         use_deepseek_fp8_block_scale = False
         use_w4a8_group_scaling = False
+        use_woq_group_scaling = False
         weight_dtype = self.w3_w1_weight.dtype
         x_sf = None
         if self.has_any_quant:
@@ -233,7 +245,11 @@ class CutlassFusedMoE(MoE):
                 use_deepseek_fp8_block_scale = True
             elif self.has_w4afp8:
                 use_w4a8_group_scaling = True
+                use_woq_group_scaling = True
                 weight_dtype = torch.quint4x2
+            # TODO: add support for weight only quantization with per group scaling
+            elif self.has_woq_per_group_scaling:
+                use_woq_group_scaling = True
             elif self.has_nvfp4:
                 if run_post_quant_allgather:
                     if isinstance(x, Fp4QuantizedTensor):
@@ -253,10 +269,10 @@ class CutlassFusedMoE(MoE):
                         x, x_sf = torch.ops.trtllm.fp4_quantize(
                             x, self.fc31_input_scale, self.scaling_vector_size,
                             False, True)
-            else:
-                raise ValueError(
-                    f"unsupported quantization mode: {self.quant_config.quant_mode}"
-                )
+            # else:
+            #     raise ValueError(
+            #         f"unsupported quantization mode: {self.quant_config.quant_mode}"
+            #     )
 
         # gather inputs for attention dp
         if run_post_quant_allgather:
@@ -296,6 +312,7 @@ class CutlassFusedMoE(MoE):
             enable_alltoall=self.enable_alltoall,
             use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
             use_w4a8_group_scaling=use_w4a8_group_scaling,
+            use_woq_group_scaling=use_woq_group_scaling,
             min_latency_mode=False,
             tune_max_num_tokens=self.tune_max_num_tokens,
         )

@@ -93,14 +93,44 @@ public:
         }
     };
 
+    template <typename TypeAct>
+    std::unique_ptr<kernels::CutlassMoeFCRunnerInterface> create_weight_quant_runner()
+    {
+        if (isWInt8Quant())
+        {
+            return std::make_unique<kernels::CutlassMoeFCRunner<TypeAct, uint8_t>>();
+        }
+        else if (isInt4Quant())
+        {
+#ifdef ENABLE_FP8
+            if (mUseW4A8GroupScaling)
+            {
+                return std::make_unique<
+                    kernels::CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, TypeAct, TypeAct>>();
+            }
+            else
+            {
+                return std::make_unique<kernels::CutlassMoeFCRunner<TypeAct, cutlass::uint4b_t>>();
+            }
+#endif
+            return std::make_unique<kernels::CutlassMoeFCRunner<TypeAct, cutlass::uint4b_t>>();
+        }
+        else
+        {
+            C10_THROW_ERROR_FORMATTED(Error, "Unsupported weight quantization type");
+        }
+    }
+
     FusedMoeRunner(c10::ScalarType activation_dtype, c10::ScalarType weight_dtype, c10::ScalarType output_dtype,
-        bool use_deepseek_fp8_block_scale, bool use_w4a8_group_scaling, bool use_mxfp8_act_scaling)
+        bool use_deepseek_fp8_block_scale, bool use_w4a8_group_scaling, bool use_woq_group_scaling,
+        bool use_mxfp8_act_scaling)
     {
         mActivationDtype = activation_dtype;
         mWeightDtype = weight_dtype;
         mOutputDtype = output_dtype;
         mUseDeepSeekFP8BlockScaling = use_deepseek_fp8_block_scale;
         mUseW4A8GroupScaling = use_w4a8_group_scaling;
+        mUseWoqGroupScaling = use_woq_group_scaling;
         mUseMxfp8ActScaling = use_mxfp8_act_scaling;
         mInnerDimMultiplier = 1;
 
@@ -150,43 +180,18 @@ public:
             }
         }
 #endif
-        if (isInt4Quant())
+        if (isWeightOnlyQuant())
         {
-            mInnerDimMultiplier = 2;
-            if (mActivationDtype == c10::ScalarType::Half)
+            if (isInt4Quant())
             {
-#ifdef ENABLE_FP8
-                if (mUseW4A8GroupScaling)
-                {
-                    mKernelRunner
-                        = std::make_unique<kernels::CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, half, half>>();
-                }
-                else
-                {
-                    mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<half, cutlass::uint4b_t>>();
-                }
-#else
-                mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<half, cutlass::uint4b_t>>();
-#endif
+                mInnerDimMultiplier = 2;
             }
-#ifdef ENABLE_BF16
-            else if (mActivationDtype == c10::ScalarType::BFloat16)
+            switch (mActivationDtype)
             {
-#ifdef ENABLE_FP8
-                if (mUseW4A8GroupScaling)
-                {
-                    mKernelRunner = std::make_unique<
-                        kernels::CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, __nv_bfloat16, __nv_bfloat16>>();
-                }
-                else
-                {
-                    mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<__nv_bfloat16, cutlass::uint4b_t>>();
-                }
-#else
-                mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<__nv_bfloat16, cutlass::uint4b_t>>();
-#endif
+            case c10::ScalarType::Half: mKernelRunner = create_weight_quant_runner<half>(); break;
+            case c10::ScalarType::BFloat16: mKernelRunner = create_weight_quant_runner<__nv_bfloat16>(); break;
+            default: C10_THROW_ERROR_FORMATTED(Error, "Unsupported activation type for int-type weight");
             }
-#endif
         }
         if (!mKernelRunner)
         {
@@ -503,7 +508,7 @@ public:
         int64_t const num_rows = input.sizes()[0];
         int64_t const hidden_size = fc2_expert_weights.sizes()[1];
         int64_t const inter_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
-        int64_t const group_size = isInt4Quant() ? 128 : -1;
+        int64_t const group_size = mUseWoqGroupScaling ? 128 : -1;
         int const num_experts = static_cast<int>(fc2_expert_weights.sizes()[0] * ep_size);
 
         // Get specific profile configs according to the profile_id.
@@ -580,6 +585,7 @@ private:
 
     bool mUseDeepSeekFP8BlockScaling = false;
     bool mUseW4A8GroupScaling = false;
+    bool mUseWoqGroupScaling = false;
     bool mUseMxfp8ActScaling = false;
 
     using Profile = tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
@@ -867,27 +873,44 @@ private:
             return kernels::QuantParams::FP8BlockScaling(
                 static_cast<float const*>(fc1_scales.data_ptr()), static_cast<float const*>(fc2_scales.data_ptr()));
         }
-        else if (isInt4Quant())
+        else if (isWeightOnlyQuant())
         {
-            TORCH_CHECK(quant_scales.has_value(), "Expecting quant scales for INT4 quantization");
-            TORCH_CHECK(quant_scales.value().size() == 8, "Expecting 8 quant scales for INT4 quantization");
-            auto& fc1_weight_scales = quant_scales.value()[0];
-            auto& fc2_weight_scales = quant_scales.value()[1];
-            auto& fc1_act_scales = quant_scales.value()[2];
-            auto& fc2_act_scales = quant_scales.value()[3];
-            auto& fc1_weight_zeros = quant_scales.value()[4];
-            auto& fc2_weight_zeros = quant_scales.value()[5];
-            auto& fc1_alpha = quant_scales.value()[6];
-            auto& fc2_alpha = quant_scales.value()[7];
-            int group_size = 128;
-            return kernels::QuantParams::GroupWise(group_size, static_cast<void const*>(fc1_weight_scales.data_ptr()),
-                static_cast<void const*>(fc2_weight_scales.data_ptr()),
-                static_cast<void const*>(fc1_act_scales.numel() > 0 ? fc1_act_scales.data_ptr() : nullptr),
-                static_cast<void const*>(fc2_act_scales.numel() > 0 ? fc2_act_scales.data_ptr() : nullptr),
-                static_cast<void const*>(fc1_weight_zeros.numel() > 0 ? fc1_weight_zeros.data_ptr() : nullptr),
-                static_cast<void const*>(fc2_weight_zeros.numel() > 0 ? fc2_weight_zeros.data_ptr() : nullptr),
-                static_cast<float const*>(fc1_alpha.numel() > 0 ? fc1_alpha.data_ptr() : nullptr),
-                static_cast<float const*>(fc2_alpha.numel() > 0 ? fc2_alpha.data_ptr() : nullptr));
+            TORCH_CHECK(quant_scales.has_value(), "Expecting quant scales for weight only quantization");
+            if (!mUseWoqGroupScaling)
+            {
+                TORCH_CHECK(quant_scales.value().size() == 2, "Expecting 2 quant scales for weight only quantization");
+                auto& fc1_weight_scales = quant_scales.value()[0];
+                auto& fc2_weight_scales = quant_scales.value()[1];
+                return kernels::QuantParams::Int(static_cast<float const*>(fc1_weight_scales.data_ptr()),
+                    static_cast<float const*>(fc2_weight_scales.data_ptr()));
+            }
+            // TODO: support groupwise quantization for int8 weight only
+            else if (isInt4Quant())
+            {
+                TORCH_CHECK(quant_scales.value().size() == 8, "Expecting 8 quant scales for INT4 quantization");
+                auto& fc1_weight_scales = quant_scales.value()[0];
+                auto& fc2_weight_scales = quant_scales.value()[1];
+                auto& fc1_act_scales = quant_scales.value()[2];
+                auto& fc2_act_scales = quant_scales.value()[3];
+                auto& fc1_weight_zeros = quant_scales.value()[4];
+                auto& fc2_weight_zeros = quant_scales.value()[5];
+                auto& fc1_alpha = quant_scales.value()[6];
+                auto& fc2_alpha = quant_scales.value()[7];
+                int group_size = 128;
+                return kernels::QuantParams::GroupWise(group_size,
+                    static_cast<void const*>(fc1_weight_scales.data_ptr()),
+                    static_cast<void const*>(fc2_weight_scales.data_ptr()),
+                    static_cast<void const*>(fc1_act_scales.numel() > 0 ? fc1_act_scales.data_ptr() : nullptr),
+                    static_cast<void const*>(fc2_act_scales.numel() > 0 ? fc2_act_scales.data_ptr() : nullptr),
+                    static_cast<void const*>(fc1_weight_zeros.numel() > 0 ? fc1_weight_zeros.data_ptr() : nullptr),
+                    static_cast<void const*>(fc2_weight_zeros.numel() > 0 ? fc2_weight_zeros.data_ptr() : nullptr),
+                    static_cast<float const*>(fc1_alpha.numel() > 0 ? fc1_alpha.data_ptr() : nullptr),
+                    static_cast<float const*>(fc2_alpha.numel() > 0 ? fc2_alpha.data_ptr() : nullptr));
+            }
+            else
+            {
+                TORCH_CHECK(false, "Unsupported weight only quantization");
+            }
         }
         else
         {
@@ -907,6 +930,11 @@ private:
             && mActivationDtype != c10::ScalarType::Float8_e4m3fn; // FP8 activation does not use FP4
     }
 
+    bool isWInt8Quant() const
+    {
+        return mWeightDtype == c10::ScalarType::Char;
+    }
+
     bool isInt4Quant() const
     {
         return mWeightDtype == c10::ScalarType::QUInt4x2;
@@ -915,6 +943,11 @@ private:
     bool isW4AFp8Quant() const
     {
         return mActivationDtype == c10::ScalarType::Float8_e4m3fn && isInt4Quant();
+    }
+
+    bool isWeightOnlyQuant() const
+    {
+        return isWInt8Quant() || isInt4Quant();
     }
 
     bool isWMxfp4AFp8Quant() const
@@ -935,7 +968,7 @@ private:
 TORCH_LIBRARY(trtllm, m)
 {
     m.class_<torch_ext::FusedMoeRunner>("FusedMoeRunner")
-        .def(torch::init<c10::ScalarType, c10::ScalarType, c10::ScalarType, bool, bool, bool>())
+        .def(torch::init<c10::ScalarType, c10::ScalarType, c10::ScalarType, bool, bool, bool, bool>())
         .def("run_gemm_profile", &torch_ext::FusedMoeRunner::runGemmProfile)
         .def("get_tactic_num", &torch_ext::FusedMoeRunner::getTacticNum)
         .def("run_moe", &torch_ext::FusedMoeRunner::runMoe)

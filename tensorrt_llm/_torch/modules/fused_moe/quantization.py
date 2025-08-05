@@ -671,9 +671,6 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
             requires_grad=False)
         module.register_parameter("fc2_weight_scale", fc2_weight_scale)
 
-        print(f"fc31_weight_scale.shape: {fc31_weight_scale.shape}")
-        print(f"fc2_weight_scale.shape: {fc2_weight_scale.shape}")
-
         fc31_alpha = nn.Parameter(torch.empty(module.expert_size_per_partition,
                                               1,
                                               dtype=torch.float32),
@@ -866,27 +863,31 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
 
 
 class WeightOnlyFusedMoEMethod(FusedMoEMethodBase):
-    """
-    Base class for Weight Only Quantization fused MoE methods.
-    """
 
     def create_weights(self, module: torch.nn.Module):
+        module.sm_version = get_sm_version()
+        module.sm_version = 80 if module.sm_version >= 90 else module.sm_version
+        module.preprocessor = preprocess_weights_for_mixed_gemm
+
         weight_dtype = torch.int8
         # int4 weight are packed into int8
         if module.quant_config.layer_quant_mode.is_int8_weight_only():
-            weight_id = 1
+            pass
         elif module.quant_config.layer_quant_mode.is_int4_weight_only():
-            weight_id = 2
+            pass
         else:
             raise NotImplementedError(
                 f"Weight Only Quantization is unsupported on {module.quant_config.layer_quant_mode}."
             )
 
+        # notice the weight shape for weight-only is different from the original shape,
+        # since the quantized weights have their own layout
         w3_w1_weight_shape = (module.expert_size_per_partition,
-                              module.intermediate_size_per_partition * 2,
-                              module.hidden_size // weight_id)
-        w2_weight_shape = (module.expert_size_per_partition, module.hidden_size,
-                           module.intermediate_size_per_partition // weight_id)
+                              module.hidden_size,
+                              module.intermediate_size_per_partition * 2)
+        w2_weight_shape = (module.expert_size_per_partition,
+                           module.intermediate_size_per_partition,
+                           module.hidden_size)
 
         fc31_weight_scale = nn.Parameter(torch.empty(
             module.expert_size_per_partition,
@@ -938,22 +939,22 @@ class WeightOnlyFusedMoEMethod(FusedMoEMethodBase):
         w31_weight_shard = torch.cat([w3_weight_shard, w1_weight_shard], dim=0)
 
         # preprocess the weights for mixed gemm
-        preprocessor = preprocess_weights_for_mixed_gemm
         if module.quant_config.layer_quant_mode.is_int8_weight_only():
             weight_dtype = torch.int8
-        elif module.quant_config.layer_quant_mode.is_int4_weight_only():
-            weight_dtype = torch.quint4x2
-            packer = torch.ops.trtllm.pack_int8_tensor_to_packed_int4
-            unpacker = torch.ops.trtllm.unpack_int4_packed_tensor_to_int8
-            w31_weight_shard = packer(
-                unpacker(w31_weight_shard.cpu()).T.contiguous()).to(
-                    w31_weight_shard.device)
+        # elif module.quant_config.layer_quant_mode.is_int4_weight_only():
+        #     weight_dtype = torch.quint4x2
+        #     packer = torch.ops.trtllm.pack_int8_tensor_to_packed_int4
+        #     unpacker = torch.ops.trtllm.unpack_int4_packed_tensor_to_int8
+        #     w31_weight_shard = packer(
+        #         unpacker(w31_weight_shard.cpu()).T.contiguous()).to(
+        #             w31_weight_shard.device)
 
         assert module.dtype in [torch.float16, torch.bfloat16], \
             f"activation dtype should be float16 or bfloat16, got {module.dtype}"
-        w31_weight_shard = preprocessor(w31_weight_shard, weight_dtype,
-                                        module.dtype).view(
-                                            dst_w3_w1_weight.shape)
+
+        w31_weight_shard = module.preprocessor(w31_weight_shard.T.contiguous(),
+                                               weight_dtype, module.dtype,
+                                               module.sm_version).contiguous()
         dst_w3_w1_weight.copy_(w31_weight_shard.view(dst_w3_w1_weight.dtype),
                                non_blocking=True)
 
@@ -968,22 +969,22 @@ class WeightOnlyFusedMoEMethod(FusedMoEMethodBase):
                                             TensorParallelMode.ROW)
 
         # preprocess the weights for mixed gemm
-        preprocessor = preprocess_weights_for_mixed_gemm
         if module.quant_config.layer_quant_mode.is_int8_weight_only():
             weight_dtype = torch.int8
-        elif module.quant_config.layer_quant_mode.is_int4_weight_only():
-            weight_dtype = torch.quint4x2
-            packer = torch.ops.trtllm.pack_int8_tensor_to_packed_int4
-            unpacker = torch.ops.trtllm.unpack_int4_packed_tensor_to_int8
-            w2_weight_shard = packer(
-                unpacker(w2_weight_shard.cpu()).T.contiguous()).to(
-                    w2_weight_shard.device)
+        # elif module.quant_config.layer_quant_mode.is_int4_weight_only():
+        #     weight_dtype = torch.quint4x2
+        #     packer = torch.ops.trtllm.pack_int8_tensor_to_packed_int4
+        #     unpacker = torch.ops.trtllm.unpack_int4_packed_tensor_to_int8
+        #     w31_weight_shard = packer(
+        #         unpacker(w31_weight_shard.cpu()).T.contiguous()).to(
+        #             w31_weight_shard.device)
 
         assert module.dtype in [torch.float16, torch.bfloat16], \
             f"activation dtype should be float16 or bfloat16, got {module.dtype}"
-        w2_weight_shard = preprocessor(w2_weight_shard, weight_dtype,
-                                       module.dtype).view(dst_w2_weight.shape)
 
+        w2_weight_shard = module.preprocessor(w2_weight_shard.T.contiguous(),
+                                              weight_dtype, module.dtype,
+                                              module.sm_version).contiguous()
         dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype),
                             non_blocking=True)
 

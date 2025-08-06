@@ -112,8 +112,9 @@ public:
             {
                 return std::make_unique<kernels::CutlassMoeFCRunner<TypeAct, cutlass::uint4b_t>>();
             }
-#endif
+#else
             return std::make_unique<kernels::CutlassMoeFCRunner<TypeAct, cutlass::uint4b_t>>();
+#endif
         }
         else
         {
@@ -528,7 +529,8 @@ public:
             hidden_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
             inter_size = fc2_expert_weights.sizes()[1];
         }
-        int64_t const group_size = mUseWoqGroupScaling or mUseW4A8GroupScaling ? 128 : -1;
+
+        int64_t const group_size = mUseWoqGroupScaling or mUseW4A8GroupScaling ? WEIGHT_QUANT_GROUP_SIZE : -1;
         int const num_experts = static_cast<int>(fc2_expert_weights.sizes()[0] * ep_size);
 
         // Get specific profile configs according to the profile_id.
@@ -608,6 +610,9 @@ private:
     bool mUseWoqPerChannel = false;
     bool mUseWoqGroupScaling = false;
     bool mUseMxfp8ActScaling = false;
+
+    // Default weight quantization group size
+    static constexpr int WEIGHT_QUANT_GROUP_SIZE = 128;
 
     using Profile = tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
     std::vector<Profile> mAllProfiles;
@@ -916,7 +921,7 @@ private:
                 auto& fc2_weight_zeros = quant_scales.value()[5];
                 auto& fc1_alpha = quant_scales.value()[6];
                 auto& fc2_alpha = quant_scales.value()[7];
-                int group_size = 128;
+                int group_size = WEIGHT_QUANT_GROUP_SIZE;
                 return kernels::QuantParams::GroupWise(group_size,
                     static_cast<void const*>(fc1_weight_scales.data_ptr()),
                     static_cast<void const*>(fc2_weight_scales.data_ptr()),

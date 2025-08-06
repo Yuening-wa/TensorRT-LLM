@@ -984,7 +984,7 @@ def test_fused_moe_w4afp8(dtype):
     torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
 
 
-@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("weight_dtype", [torch.int8])
 def test_fused_moe_weight_only(dtype, weight_dtype):
 
@@ -1088,7 +1088,7 @@ def test_fused_moe_weight_only(dtype, weight_dtype):
     # compare
     torch.cuda.synchronize()
     atol = calc_woq_tolerence(ref_output, weight_dtype)
-    torch.testing.assert_close(output, ref_output, rtol=1e-27, atol=atol)
+    torch.testing.assert_close(output, ref_output, rtol=1e-7, atol=atol)
 
 
 class RefGatedMLPFusedMoE(nn.Module):
